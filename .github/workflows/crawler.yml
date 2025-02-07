@@ -1,0 +1,40 @@
+# .github/workflows/crawler.yml
+
+name: CoolPC Crawler
+on:
+  schedule:
+    # 設定cron在UTC時間 11:00 執行 => 轉成台灣時間就是19:00(晚上7點)
+    # CRON格式: 分 時 日 月 星期
+    - cron: "0 11 * * *"
+  workflow_dispatch: # 允許手動觸發
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v3
+      
+      # 1) 把 base64編碼後的JSON Secrets拿出來、解碼成檔案
+      - name: Decode Service Account
+        run: |
+          echo "$SVC_ACCT_B64" | base64 -d > service_account.json
+        shell: bash
+        env:
+          SVC_ACCT_B64: ${{ secrets.SVC_ACCT_B64 }}
+
+      # 2) 設定Python
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v3
+        with:
+          python-version: 3.9
+
+      # 3) 安裝爬蟲需要的套件
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install selenium webdriver-manager gspread oauth2client openpyxl
+
+      # 4) 執行main.py
+      - name: Run crawler
+        run: python main.py
