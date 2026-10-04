@@ -41,24 +41,24 @@ def main():
             days_info.append((day_str, year_folder_str))
 
         # 1) 先抓昨天 (index=0) 與 前天 (index=1)，各嘗試一次
-        results = [0, 0, 0, 0, 0]  # 預設五天的組裝數都給 0
+        results = [None] * 5  # None 表示抓取失敗；0 是有效數值
         for i in range(2):
             day_str, year_folder_str = days_info[i]
             assemble_count = single_attempt_coolpc(year_folder_str, day_str)
             results[i] = assemble_count
             print(f"[INFO] 第{i+1}天(偏移: {i+1}) => {day_str} => assemble_count={assemble_count}")
 
-        # 2) 如果昨天和前天都為 0，再額外重開最多三次
-        if results[0] == 0 and results[1] == 0:
-            print("[WARNING] 昨天與前天都抓不到資料，再重開三次資料夾嘗試看看～")
+        # 2) 前兩天若有抓取失敗，只重試失敗日期，最多三次
+        if results[0] is None or results[1] is None:
+            print("[WARNING] 前兩天有抓取失敗，再重開三次資料夾嘗試看看～")
             for retry in range(3):
                 for i in range(2):
-                    # 如果已經抓到了 (>0) 就不用再抓
-                    if results[i] != 0:
+                    # 已成功取得（包括 0）就不用再抓
+                    if results[i] is not None:
                         continue
                     day_str, year_folder_str = days_info[i]
                     assemble_count = single_attempt_coolpc(year_folder_str, day_str)
-                    if assemble_count > 0:
+                    if assemble_count is not None:
                         results[i] = assemble_count
                         print(f"[INFO] 重開第{retry+1}次 => 抓到 {day_str}={assemble_count}")
                 # 如果昨天或前天在這次重開中抓到了，也繼續再試其他天
@@ -76,11 +76,17 @@ def main():
         for i in range(5):
             day_str, _ = days_info[i]
             assemble_count = results[i]
-            update_or_append(worksheet, (day_str, assemble_count))
+            if assemble_count is not None:
+                update_or_append(worksheet, (day_str, assemble_count))
+
+        failed_days = [days_info[i][0] for i, count in enumerate(results) if count is None]
+        if failed_days:
+            raise RuntimeError(f"抓取失敗，已保留原值的日期：{', '.join(failed_days)}")
 
     except Exception as e:
         print("[ERROR] 程式出現例外:")
         traceback.print_exc()
+        raise
 
 
 def connect_google_sheet(json_keyfile_path, sheet_name, worksheet_name):
@@ -103,9 +109,10 @@ def connect_google_sheet(json_keyfile_path, sheet_name, worksheet_name):
 def single_attempt_coolpc(year_folder, day_str):
     """
     嘗試一次開 Selenium、進入「year_folder / day_str」資料夾。
-    若能抓到組裝數，就回傳；否則回傳 0。
+    若能抓到非負組裝數（包括 0），就回傳；失敗回傳 None。
     """
-    assemble_count = 0
+    assemble_count = None
+    driver = None
     try:
         options = webdriver.ChromeOptions()
         options.add_argument("--headless")
@@ -142,11 +149,14 @@ def single_attempt_coolpc(year_folder, day_str):
         )
         footer_text = footer_elem.text.strip()  # e.g. "48 個項目"
         count_str = footer_text.split(" ")[0]
-        assemble_count = int(count_str)
+        parsed_count = int(count_str)
+        if parsed_count < 0:
+            raise ValueError("組裝數不可為負數")
+        assemble_count = parsed_count
         print(f"[INFO] 成功抓到『{day_str}』的組裝數 = {assemble_count}")
 
     except Exception as e:
-        print(f"[WARNING] 嘗試抓取 {year_folder}/{day_str} 時失敗，回傳 0：{e}")
+        print(f"[WARNING] 嘗試抓取 {year_folder}/{day_str} 時失敗，保留原值：{e}")
 
     finally:
         try:
@@ -162,6 +172,8 @@ def update_or_append(worksheet, row_data):
     只讀試算表最後 5 行(純文字)，若第一欄有同樣 day_str 就覆蓋，否則插到最後。
     """
     day_str, assemble_count = row_data
+    if type(assemble_count) is not int or assemble_count < 0:
+        raise ValueError("拒絕將未取得或無效組裝數寫入試算表")
     current_data = worksheet.get_all_values()
     row_count = len(current_data)
 
