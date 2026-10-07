@@ -7,6 +7,12 @@ on:
     # CRON格式: 分 時 日 月 星期
     - cron: "0 15 * * *"
   workflow_dispatch: # 允許手動觸發
+
+# 待補抓清單與試算表只有一個寫入端，避免重疊執行互相覆蓋。
+concurrency:
+  group: coolpc-crawler
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,6 +20,14 @@ jobs:
     steps:
       - name: Check out repository code
         uses: actions/checkout@v3
+
+      - name: Restore pending dates
+        uses: actions/cache/restore@v4
+        with:
+          path: pending_dates.json
+          key: coolpc-pending-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            coolpc-pending-v1-
       
       # 1) 把 base64編碼後的JSON Secrets拿出來、解碼成檔案
       - name: Decode Service Account
@@ -38,3 +52,11 @@ jobs:
       # 4) 執行main.py
       - name: Run crawler
         run: python main.py
+
+      # 讀取失敗時也保存清單，延遲超過五天的日期仍可在之後補抓。
+      - name: Save pending dates
+        if: always() && hashFiles('pending_dates.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: pending_dates.json
+          key: coolpc-pending-v1-${{ github.run_id }}-${{ github.run_attempt }}
