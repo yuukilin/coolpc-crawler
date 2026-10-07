@@ -1,8 +1,11 @@
 # main.py
-import os
+import json
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import Enum
+from pathlib import Path
 from zoneinfo import ZoneInfo  # Python 3.9+ 可用 zoneinfo 取得台灣時區
 
 from selenium import webdriver
@@ -16,11 +19,67 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 
+PENDING_FILE = Path("pending_dates.json")
+
+
+class FetchStatus(Enum):
+    SUCCESS = "success"
+    PENDING = "pending"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    status: FetchStatus
+    count: int = None
+
+
+def parse_day(day_str):
+    if not isinstance(day_str, str) or len(day_str) != 7 or not day_str.isdigit():
+        raise ValueError(f"無效的民國日期：{day_str!r}")
+    return datetime(int(day_str[:3]) + 1911, int(day_str[3:5]), int(day_str[5:]))
+
+
+def load_pending_dates(path=PENDING_FILE):
+    if not path.exists():
+        return set()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("version") != 1 or not isinstance(payload.get("dates"), list):
+        raise ValueError("待補抓清單格式錯誤")
+    for day_str in payload["dates"]:
+        parse_day(day_str)
+    return set(payload["dates"])
+
+
+def save_pending_dates(dates, path=PENDING_FILE):
+    temporary_path = path.with_suffix(".tmp")
+    temporary_path.write_text(
+        json.dumps({"version": 1, "dates": sorted(dates)}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+
+
+def target_days(today, pending_dates):
+    dates = set(pending_dates)
+    for offset in range(1, 6):
+        day = today - timedelta(days=offset)
+        dates.add(f"{day.year - 1911:03}{day.month:02}{day.day:02}")
+    for day_str in dates:
+        if parse_day(day_str).date() >= today.date():
+            raise ValueError(f"待補抓日期必須早於今天：{day_str}")
+    return sorted(dates, reverse=True)
+
+
 def main():
     try:
         taiwan_tz = ZoneInfo("Asia/Taipei")
         today = datetime.now(tz=taiwan_tz)
-        print(f"[INFO] 今天是 {today.strftime('%Y/%m/%d')}，接下來要抓取往前 5 天的資料。")
+        days = target_days(today, load_pending_dates())
+        # 先保留所有目標；中斷或寫入失敗時，下次仍會補抓。
+        remaining = set(days)
+        save_pending_dates(remaining)
+        print(f"[INFO] 今天是 {today.strftime('%Y/%m/%d')}，抓取近 5 天及待補抓日期，共 {len(days)} 天。")
 
         # 連線到 Google Sheet
         json_keyfile_path = "service_account.json"
@@ -30,58 +89,30 @@ def main():
             worksheet_name="原價屋網路PC組裝數RD"       # 你可以改
         )
 
-        # 用一個 list 先把各天算出來 (day_str, year_folder_str)
-        # offset=1 => 昨天, offset=2 => 前天, ..., offset=5 => 前5天
-        days_info = []
-        for offset in range(1, 6):
-            target_date = today - timedelta(days=offset)
-            minguo_year = target_date.year - 1911
-            day_str = f"{minguo_year:03}{target_date.month:02}{target_date.day:02}"
-            year_folder_str = f"{minguo_year}年"
-            days_info.append((day_str, year_folder_str))
-
-        # 1) 先抓昨天 (index=0) 與 前天 (index=1)，各嘗試一次
-        results = [None] * 5  # None 表示抓取失敗；0 是有效數值
-        for i in range(2):
-            day_str, year_folder_str = days_info[i]
-            assemble_count = single_attempt_coolpc(year_folder_str, day_str)
-            results[i] = assemble_count
-            print(f"[INFO] 第{i+1}天(偏移: {i+1}) => {day_str} => assemble_count={assemble_count}")
-
-        # 2) 前兩天若有抓取失敗，只重試失敗日期，最多三次
-        if results[0] is None or results[1] is None:
-            print("[WARNING] 前兩天有抓取失敗，再重開三次資料夾嘗試看看～")
+        results = {}
+        year_dates_cache = {}
+        for day_str in days:
+            year_folder = f"{int(day_str[:3])}年"
+            result = single_attempt_coolpc(year_folder, day_str, year_dates_cache)
+            # 尚未上架不在同次執行反覆重試；真正讀取失敗才重開瀏覽器。
             for retry in range(3):
-                for i in range(2):
-                    # 已成功取得（包括 0）就不用再抓
-                    if results[i] is not None:
-                        continue
-                    day_str, year_folder_str = days_info[i]
-                    assemble_count = single_attempt_coolpc(year_folder_str, day_str)
-                    if assemble_count is not None:
-                        results[i] = assemble_count
-                        print(f"[INFO] 重開第{retry+1}次 => 抓到 {day_str}={assemble_count}")
-                # 如果昨天或前天在這次重開中抓到了，也繼續再試其他天
-            print(f"[INFO] 重開結束，昨天({days_info[0][0]})={results[0]}，前天({days_info[1][0]})={results[1]}")
+                if result.status != FetchStatus.ERROR:
+                    break
+                print(f"[WARNING] {day_str} 讀取失敗，重試第 {retry + 1} 次。")
+                result = single_attempt_coolpc(year_folder, day_str, year_dates_cache)
+            results[day_str] = result
+            if result.status == FetchStatus.SUCCESS:
+                update_or_append(worksheet, (day_str, result.count))
+                remaining.remove(day_str)
+                save_pending_dates(remaining)
 
-        # 3) 再處理剩下的天數 offset=3,4,5
-        for i in range(2, 5):
-            day_str, year_folder_str = days_info[i]
-            assemble_count = single_attempt_coolpc(year_folder_str, day_str)
-            results[i] = assemble_count
-            print(f"[INFO] 第{i+1}天(偏移: {i+1}) => {day_str} => assemble_count={assemble_count}")
+        pending_days = [day for day, result in results.items() if result.status == FetchStatus.PENDING]
+        if pending_days:
+            print(f"::notice::日期相簿尚未上架，已保留原值並列入下次補抓：{', '.join(pending_days)}")
 
-        # 4) 全部抓完以後，寫回試算表
-        #    注意：要用 update_or_append() 一天一天處理，以免有人只抓部分
-        for i in range(5):
-            day_str, _ = days_info[i]
-            assemble_count = results[i]
-            if assemble_count is not None:
-                update_or_append(worksheet, (day_str, assemble_count))
-
-        failed_days = [days_info[i][0] for i, count in enumerate(results) if count is None]
+        failed_days = [day for day, result in results.items() if result.status == FetchStatus.ERROR]
         if failed_days:
-            raise RuntimeError(f"抓取失敗，已保留原值的日期：{', '.join(failed_days)}")
+            raise RuntimeError(f"頁面讀取失敗，已保留原值並列入下次補抓：{', '.join(failed_days)}")
 
     except Exception as e:
         print("[ERROR] 程式出現例外:")
@@ -106,14 +137,19 @@ def connect_google_sheet(json_keyfile_path, sheet_name, worksheet_name):
     return worksheet
 
 
-def single_attempt_coolpc(year_folder, day_str):
+def single_attempt_coolpc(year_folder, day_str, year_dates_cache=None):
     """
     嘗試一次開 Selenium、進入「year_folder / day_str」資料夾。
-    若能抓到非負組裝數（包括 0），就回傳；失敗回傳 None。
+    回傳成功、尚未上架或讀取失敗；只有成功結果可以寫入試算表。
     """
-    assemble_count = None
     driver = None
+    stage = "開啟瀏覽器"
     try:
+        # 同一次執行已確認缺席的日期，不必逐日重開瀏覽器。
+        if year_dates_cache is not None and year_folder in year_dates_cache:
+            if day_str not in year_dates_cache[year_folder]:
+                print(f"[PENDING] {year_folder}/{day_str} 尚未上架；保留原值，下次補抓。")
+                return FetchResult(FetchStatus.PENDING)
         options = webdriver.ChromeOptions()
         options.add_argument("--headless")
         options.add_argument("--no-sandbox")
@@ -125,25 +161,39 @@ def single_attempt_coolpc(year_folder, day_str):
         )
         wait = WebDriverWait(driver, 20)
 
+        stage = "開啟原價屋相簿"
         driver.get("https://www.coolpc.com.tw/photo/#/shared_space/folder/156?_k=tr98b7")
         time.sleep(10)
 
         # 點「每日組裝分享 (僅網路部)」
+        stage = "開啟每日組裝分享"
         share_folder_xpath = "//div[@class='css-106gz8u' and text()='每日組裝分享 (僅網路部)']"
         wait.until(EC.element_to_be_clickable((By.XPATH, share_folder_xpath))).click()
         time.sleep(10)
 
         # 點「xxx年」資料夾
+        stage = "載入年份目錄"
         year_xpath = f"//div[@class='css-106gz8u' and text()='{year_folder}']"
         wait.until(EC.element_to_be_clickable((By.XPATH, year_xpath))).click()
         time.sleep(10)
 
+        # 年份側欄目錄由相簿一次載入，先確認它已展開且有日期清單。
+        # 目錄載入逾時仍是 ERROR；只有已載入清單中沒有日期才是 PENDING。
+        available_dates = wait.until(lambda browser: loaded_year_dates(browser, year_folder))
+        if year_dates_cache is not None:
+            year_dates_cache[year_folder] = available_dates
+        if day_str not in available_dates:
+            print(f"[PENDING] {year_folder}/{day_str} 尚未上架；保留原值，下次補抓。")
+            return FetchResult(FetchStatus.PENDING)
+
         # 點「day_str」資料夾, e.g. 1140206
+        stage = "開啟日期相簿"
         day_xpath = f"//div[@class='css-106gz8u' and text()='{day_str}']"
         wait.until(EC.element_to_be_clickable((By.XPATH, day_xpath))).click()
         time.sleep(10)
 
         # 等footer出現，抓組裝數
+        stage = "讀取組裝數"
         footer_elem = wait.until(
             EC.presence_of_element_located((By.XPATH, "//div[@class='synofoto-folder-wall-footer']"))
         )
@@ -152,11 +202,12 @@ def single_attempt_coolpc(year_folder, day_str):
         parsed_count = int(count_str)
         if parsed_count < 0:
             raise ValueError("組裝數不可為負數")
-        assemble_count = parsed_count
-        print(f"[INFO] 成功抓到『{day_str}』的組裝數 = {assemble_count}")
+        print(f"[INFO] 成功抓到『{day_str}』的組裝數 = {parsed_count}")
+        return FetchResult(FetchStatus.SUCCESS, parsed_count)
 
     except Exception as e:
-        print(f"[WARNING] 嘗試抓取 {year_folder}/{day_str} 時失敗，保留原值：{e}")
+        print(f"[WARNING] {year_folder}/{day_str} 在「{stage}」失敗，保留原值：{type(e).__name__}: {e}")
+        return FetchResult(FetchStatus.ERROR)
 
     finally:
         try:
@@ -164,12 +215,33 @@ def single_attempt_coolpc(year_folder, day_str):
         except:
             pass
 
-    return assemble_count
+
+def loaded_year_dates(driver, year_folder):
+    year_xpath = f"//div[@class='css-106gz8u' and text()='{year_folder}']/ancestor::li[1]"
+    year_items = driver.find_elements(By.XPATH, year_xpath)
+    if not year_items:
+        return False
+    year_item = year_items[0]
+    lists = year_item.find_elements(By.XPATH, "./div/ul")
+    if not lists or not lists[0].is_displayed():
+        return False
+    names = lists[0].find_elements(
+        By.XPATH, "./li/div[contains(@class, 'synofoto-treebeard-container')]/div[@class='css-106gz8u']"
+    )
+    dates = {name.text.strip() for name in names}
+    if not dates:
+        return False
+    # 結構或命名異常不能當成「尚未上架」，否則可能吞掉網站改版錯誤。
+    for date in dates:
+        parse_day(date)
+        if int(date[:3]) != int(year_folder[:-1]):
+            raise ValueError("年份目錄出現其他年度日期")
+    return dates
 
 
 def update_or_append(worksheet, row_data):
     """
-    只讀試算表最後 5 行(純文字)，若第一欄有同樣 day_str 就覆蓋，否則插到最後。
+    搜尋整張試算表，避免補抓超過五天的日期時新增重複資料。
     """
     day_str, assemble_count = row_data
     if type(assemble_count) is not int or assemble_count < 0:
@@ -179,31 +251,24 @@ def update_or_append(worksheet, row_data):
 
     # 如果整張表都還沒資料，就第一行塞入
     if row_count == 0:
-        worksheet.update("A1:B1", [[day_str, assemble_count]])
+        worksheet.update(range_name="A1:B1", values=[[day_str, assemble_count]])
         print(f"[INFO] 試算表是空的，已新增第一行: {row_data}")
         return
 
-    # 只看最後 5 行 (不足就整張表)
-    start_row = max(1, row_count - 4)
-    end_row = row_count
-    range_cells = f"A{start_row}:B{end_row}"
-    last_data = worksheet.get(range_cells)
-
     matched_row = None
-    for i, row in enumerate(last_data):
-        actual_row = start_row + i  # 轉回整張表的行號
+    for actual_row, row in enumerate(current_data, start=1):
         if len(row) > 0 and row[0] == day_str:
             matched_row = actual_row
             break
 
     if matched_row:
         cell_range = f"A{matched_row}:B{matched_row}"
-        worksheet.update(cell_range, [[day_str, assemble_count]])
+        worksheet.update(range_name=cell_range, values=[[day_str, assemble_count]])
         print(f"[INFO] 找到同日期 '{day_str}'，已覆蓋到第 {matched_row} 行，組裝數={assemble_count}")
     else:
         new_row = row_count + 1
         cell_range = f"A{new_row}:B{new_row}"
-        worksheet.update(cell_range, [[day_str, assemble_count]])
+        worksheet.update(range_name=cell_range, values=[[day_str, assemble_count]])
         print(f"[INFO] 沒找到 '{day_str}'，已新增到第 {new_row} 行，組裝數={assemble_count}")
 
 
