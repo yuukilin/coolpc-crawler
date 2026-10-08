@@ -41,7 +41,7 @@ class CrawlerTests(unittest.TestCase):
             crawler.main()
         return attempts, writes
 
-    def test_pending_dates_do_not_fail_or_write_zero(self):
+    def test_pending_dates_write_zero_and_remain_for_backfill(self):
         def fetch(year, day):
             if day in {"1151005", "1151006"}:
                 return crawler.FetchResult(crawler.FetchStatus.PENDING)
@@ -49,19 +49,26 @@ class CrawlerTests(unittest.TestCase):
 
         attempts, writes = self.run_main(fetch)
         self.assertEqual(attempts.call_count, 5)
-        self.assertEqual(writes.call_count, 3)
+        self.assertEqual(writes.call_count, 5)
+        self.assertEqual(
+            [call.args[1] for call in writes.call_args_list[:2]],
+            [("1151006", 0), ("1151005", 0)],
+        )
         self.assertEqual(crawler.load_pending_dates(), {"1151005", "1151006"})
         self.assertIn("::notice::", self.output.getvalue())
 
-    def test_actual_errors_still_fail_after_retries(self):
+    def test_actual_errors_write_zero_after_retries(self):
         def fetch(year, day):
             status = crawler.FetchStatus.ERROR if day == "1151006" else crawler.FetchStatus.SUCCESS
             return crawler.FetchResult(status, 0 if status == crawler.FetchStatus.SUCCESS else None)
 
-        with self.assertRaisesRegex(RuntimeError, "頁面讀取失敗.*1151006"):
-            self.run_main(fetch)
+        attempts, writes = self.run_main(fetch)
+        self.assertEqual(attempts.call_count, 8)
+        self.assertEqual(writes.call_count, 5)
+        self.assertEqual(writes.call_args_list[0].args[1], ("1151006", 0))
         self.assertEqual(crawler.load_pending_dates(), {"1151006"})
         self.assertEqual(self.output.getvalue().count("重試第"), 3)
+        self.assertIn("頁面讀取失敗，已寫入 0", self.output.getvalue())
 
     def test_zero_is_success_and_not_retried(self):
         attempts, writes = self.run_main(lambda year, day: crawler.FetchResult(crawler.FetchStatus.SUCCESS, 0))
@@ -88,8 +95,10 @@ class CrawlerTests(unittest.TestCase):
 
     def test_old_pending_survives_when_still_absent(self):
         crawler.save_pending_dates({"1150920"})
-        attempts, _ = self.run_main(lambda year, day: crawler.FetchResult(crawler.FetchStatus.PENDING))
+        attempts, writes = self.run_main(lambda year, day: crawler.FetchResult(crawler.FetchStatus.PENDING))
         self.assertEqual(attempts.call_count, 6)
+        self.assertEqual(writes.call_count, 6)
+        self.assertTrue(all(call.args[1][1] == 0 for call in writes.call_args_list))
         self.assertIn("1150920", crawler.load_pending_dates())
 
     def test_corrupt_pending_state_is_not_silently_discarded(self):
