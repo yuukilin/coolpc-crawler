@@ -101,18 +101,19 @@ def main():
                 print(f"[WARNING] {day_str} 讀取失敗，重試第 {retry + 1} 次。")
                 result = single_attempt_coolpc(year_folder, day_str, year_dates_cache)
             results[day_str] = result
+            count = result.count if result.status == FetchStatus.SUCCESS else 0
+            update_or_append(worksheet, (day_str, count))
             if result.status == FetchStatus.SUCCESS:
-                update_or_append(worksheet, (day_str, result.count))
                 remaining.remove(day_str)
                 save_pending_dates(remaining)
 
         pending_days = [day for day, result in results.items() if result.status == FetchStatus.PENDING]
         if pending_days:
-            print(f"::notice::日期相簿尚未上架，已保留原值並列入下次補抓：{', '.join(pending_days)}")
+            print(f"::notice::日期相簿尚未上架，已寫入 0 並列入下次補抓：{', '.join(pending_days)}")
 
         failed_days = [day for day, result in results.items() if result.status == FetchStatus.ERROR]
         if failed_days:
-            raise RuntimeError(f"頁面讀取失敗，已保留原值並列入下次補抓：{', '.join(failed_days)}")
+            print(f"::notice::頁面讀取失敗，已寫入 0 並列入下次補抓：{', '.join(failed_days)}")
 
     except Exception as e:
         print("[ERROR] 程式出現例外:")
@@ -140,7 +141,7 @@ def connect_google_sheet(json_keyfile_path, sheet_name, worksheet_name):
 def single_attempt_coolpc(year_folder, day_str, year_dates_cache=None):
     """
     嘗試一次開 Selenium、進入「year_folder / day_str」資料夾。
-    回傳成功、尚未上架或讀取失敗；只有成功結果可以寫入試算表。
+    回傳成功、尚未上架或讀取失敗；主程式將未取得的數值寫為 0。
     """
     driver = None
     stage = "開啟瀏覽器"
@@ -148,7 +149,7 @@ def single_attempt_coolpc(year_folder, day_str, year_dates_cache=None):
         # 同一次執行已確認缺席的日期，不必逐日重開瀏覽器。
         if year_dates_cache is not None and year_folder in year_dates_cache:
             if day_str not in year_dates_cache[year_folder]:
-                print(f"[PENDING] {year_folder}/{day_str} 尚未上架；保留原值，下次補抓。")
+                print(f"[PENDING] {year_folder}/{day_str} 尚未上架；本次寫入 0，下次補抓。")
                 return FetchResult(FetchStatus.PENDING)
         options = webdriver.ChromeOptions()
         options.add_argument("--headless")
@@ -183,7 +184,7 @@ def single_attempt_coolpc(year_folder, day_str, year_dates_cache=None):
         if year_dates_cache is not None:
             year_dates_cache[year_folder] = available_dates
         if day_str not in available_dates:
-            print(f"[PENDING] {year_folder}/{day_str} 尚未上架；保留原值，下次補抓。")
+            print(f"[PENDING] {year_folder}/{day_str} 尚未上架；本次寫入 0，下次補抓。")
             return FetchResult(FetchStatus.PENDING)
 
         # 點「day_str」資料夾, e.g. 1140206
@@ -206,7 +207,7 @@ def single_attempt_coolpc(year_folder, day_str, year_dates_cache=None):
         return FetchResult(FetchStatus.SUCCESS, parsed_count)
 
     except Exception as e:
-        print(f"[WARNING] {year_folder}/{day_str} 在「{stage}」失敗，保留原值：{type(e).__name__}: {e}")
+        print(f"[WARNING] {year_folder}/{day_str} 在「{stage}」失敗，本次寫入 0：{type(e).__name__}: {e}")
         return FetchResult(FetchStatus.ERROR)
 
     finally:
