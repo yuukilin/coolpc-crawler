@@ -19,10 +19,10 @@ jobs:
 
     steps:
       - name: Check out repository code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
 
       - name: Restore pending dates
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: pending_dates.json
           key: coolpc-pending-v1-${{ github.run_id }}-${{ github.run_attempt }}
@@ -37,11 +37,11 @@ jobs:
         env:
           SVC_ACCT_B64: ${{ secrets.SVC_ACCT_B64 }}
 
-      # 2) 設定Python
-      - name: Set up Python 3.9
-        uses: actions/setup-python@v3
+      # 2) 設定Python（GitHub 新版 Ubuntu 26.04 主機已不提供 3.9，改用 3.12）
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
         with:
-          python-version: 3.9
+          python-version: '3.12'
 
       # 3) 安裝爬蟲需要的套件
       - name: Install dependencies
@@ -56,7 +56,7 @@ jobs:
       # 讀取失敗時也保存清單，延遲超過五天的日期仍可在之後補抓。
       - name: Save pending dates
         if: always() && hashFiles('pending_dates.json') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: pending_dates.json
           key: coolpc-pending-v1-${{ github.run_id }}-${{ github.run_attempt }}
